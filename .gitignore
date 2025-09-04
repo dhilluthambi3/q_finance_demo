@@ -1,0 +1,63 @@
+# Node / Vite
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# React build outputs (if any other build folder)
+build/
+
+# Python
+backend/.venv/
+backend/venv/
+backend/__pycache__/
+backend/**/*.pyc
+backend/.pytest_cache/
+backend/.mypy_cache/
+backend/.coverage
+backend/coverage.xml
+backend/.ruff_cache/
+
+# Flask/Celery/Redis artifacts
+backend/instance/
+backend/*.db
+backend/celerybeat-schedule
+backend/celerybeat.pid
+backend/logs/
+backend/tmp/
+dump.rdb
+appendonly.aof
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Env & secrets (root or per-app)
+.env
+.env.*
+frontend/.env
+backend/.env
+
+# Cache/data
+frontend/.cache/
+backend/.cache/
+backend/storage/paths/*.npz
+backend/storage/paths/*.json
+
+todo.txt
+run.bash
+# Optional: lock files if you don’t want to commit them
+# package-lock.json
+# pnpm-lock.yaml
+# yarn.lock
+# pipenv files, poetry, etc (uncomment if used)
+# Pipfile
+# Pipfile.lock
+# poetry.lock

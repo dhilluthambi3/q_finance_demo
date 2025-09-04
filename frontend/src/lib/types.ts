@@ -1,0 +1,11 @@
+export type UUID = string
+export type Client = { id: UUID; name: string; segment: 'HNI'|'Institutional'|'Retail'; owner: string; createdAt: string; updatedAt: string; notes?: string }
+export type Portfolio = { id: UUID; clientId: UUID; name: string; baseCurrency: 'USD'|'EUR'|'INR'|'JPY'|'GBP'; mandate: 'Aggressive'|'Balanced'|'Conservative'; benchmark?: string; createdAt: string; updatedAt: string }
+export type Asset = { id: UUID; portfolioId: UUID; ticker: string; type: 'Equity'|'ETF'|'Bond'|'Option'|'Crypto'; quantity: number; avgPrice: number }
+export type JobType = 'OptionPricing'|'PortfolioOptimization'
+export type Product = 'European'|'American'|'Asian'|'Barrier'|'Basket'
+export type JobAlgo = 'BlackScholes'|'Binomial'|'MonteCarlo'|'QAE'|'MeanVariance'|'QUBO'|'QAOA'
+export type JobPriority = 'Low'|'Normal'|'High'|'Urgent'
+export type JobStatus = 'Queued'|'Running'|'Succeeded'|'Failed'|'Cancelled'
+export type Job = { id: UUID; clientId?: UUID; clientName?: string; portfolioId?: UUID; portfolioName?: string; type: JobType; product?: Product; algo: JobAlgo; priority: JobPriority; submitter: string; createdAt: string; updatedAt: string; status: JobStatus; params: Record<string,any>; result?: Record<string,any>; error?: string }
+export type User = { id: UUID; name: string; email: string; role: 'PM'|'Analyst'|'Admin'; token?: string }

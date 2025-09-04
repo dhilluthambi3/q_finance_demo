@@ -1,0 +1,1 @@
+export default function Audit(){ return(<div className='card'>Audit log placeholder</div>) }

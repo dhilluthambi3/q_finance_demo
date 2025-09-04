@@ -1,0 +1,1 @@
+export default function Settings(){ return(<div className='card'>Settings (compute backends, regions, etc.)</div>) }

@@ -1,0 +1,6 @@
+import { useNavigate, useLocation } from 'react-router-dom'
+import { useSession } from '../lib/store'
+import { login } from '../lib/api'
+export default function Login(){ const {login:save}=useSession(); const nav=useNavigate(); const loc=useLocation() as any
+  const onLogin=async(e:React.FormEvent)=>{e.preventDefault(); const f=new FormData(e.currentTarget as HTMLFormElement); const user=await login(String(f.get('email')||'pm@example.com')); save(user); nav(loc.state?.from?.pathname??'/dashboard',{replace:true})}
+  return(<div className='min-h-screen grid place-items-center'><div className='card w-full max-w-md'><h1 className='text-2xl font-semibold mb-2'>Sign in</h1><p className='text-sm text-gray-600 mb-6'>Backend login required.</p><form onSubmit={onLogin} className='space-y-3'><div><label className='label'>Email</label><input className='input' name='email' type='email' defaultValue='pm@example.com' required/></div><div><label className='label'>Password</label><input className='input' type='password' defaultValue='********' required/></div><button className='btn w-full'>Sign in</button></form></div></div>) }

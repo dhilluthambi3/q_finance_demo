@@ -1,0 +1,12 @@
+Flask
+Flask-Cors
+pymongo
+redis
+celery
+yfinance
+numpy
+scipy
+python-dotenv
+qiskit==1.4.3
+qiskit-finance
+qiskit-algorithms
