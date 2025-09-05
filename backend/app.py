@@ -8,6 +8,7 @@ from routes.portfolios import bp as portfolios_bp
 from routes.assets import bp as assets_bp
 from routes.jobs import bp as jobs_bp
 from routes.market import bp as market_bp
+from routes.options import bp as options_bp
 
 
 def create_app() -> Flask:
@@ -21,6 +22,7 @@ def create_app() -> Flask:
     app.register_blueprint(assets_bp, url_prefix="/api")
     app.register_blueprint(jobs_bp, url_prefix="/api")
     app.register_blueprint(market_bp, url_prefix="/api")
+    app.register_blueprint(options_bp, url_prefix="/api")
 
     @app.get("/health")
     def health():

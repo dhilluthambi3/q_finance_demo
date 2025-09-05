@@ -1,5 +1,6 @@
 # backend/tasks/option_pricing.py
 from . import celery_app
+from celery import shared_task
 from models.jobs import set_job_status
 from storage.paths import save_paths_npz
 from utils.finance_cache import cache_json
@@ -15,6 +16,14 @@ def _utcnow():
     return datetime.now(timezone.utc)
 
 
+def _d1(S, K, T, r, sigma, q=0.0):
+    return (log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * sqrt(T))
+
+
+def _d2(d1, T, sigma):
+    return d1 - sigma * sqrt(T)
+
+
 def black_scholes(S0, K, T, r, sigma, otype="CALL", q=0.0):
     if T <= 0 or sigma <= 0 or S0 <= 0 or K <= 0:
         return 0.0
@@ -24,6 +33,51 @@ def black_scholes(S0, K, T, r, sigma, otype="CALL", q=0.0):
         return S0 * exp(-q * T) * norm.cdf(d1) - K * exp(-r * T) * norm.cdf(d2)
     else:
         return K * exp(-r * T) * norm.cdf(-d2) - S0 * exp(-q * T) * norm.cdf(-d1)
+
+
+def black_scholes_price(S, K, T, r, sigma, otype="CALL", q=0.0):
+    if T <= 0 or sigma <= 0:
+        return max(0.0, (S - K) if otype == "CALL" else (K - S))
+    d1 = _d1(S, K, T, r, sigma, q)
+    d2 = _d2(d1, T, sigma)
+    if otype == "CALL":
+        return exp(-q * T) * S * norm.cdf(d1) - exp(-r * T) * K * norm.cdf(d2)
+    else:
+        return exp(-r * T) * K * norm.cdf(-d2) - exp(-q * T) * S * norm.cdf(-d1)
+
+
+def black_scholes_greeks(S, K, T, r, sigma, otype="CALL", q=0.0):
+    if T <= 0 or sigma <= 0:
+        return {
+            "delta": 1.0 if (otype == "CALL" and S > K) else (-1.0 if S < K else 0.0),
+            "gamma": 0,
+            "theta": 0,
+            "vega": 0,
+            "rho": 0,
+        }
+    d1 = _d1(S, K, T, r, sigma, q)
+    d2 = _d2(d1, T, sigma)
+    pdf = norm.pdf(d1)
+    Delta = (
+        exp(-q * T) * norm.cdf(d1)
+        if otype == "CALL"
+        else exp(-q * T) * (norm.cdf(d1) - 1)
+    )
+    Gamma = exp(-q * T) * pdf / (S * sigma * sqrt(T))
+    Theta = (
+        (-exp(-q * T) * S * pdf * sigma / (2 * sqrt(T)))
+        - (r * K * exp(-r * T) * norm.cdf(d2 if otype == "CALL" else -d2))
+        + (q * exp(-q * T) * S * norm.cdf(d1 if otype == "CALL" else -d1))
+    )
+    Vega = S * exp(-q * T) * pdf * sqrt(T)
+    Rho = K * T * exp(-r * T) * (norm.cdf(d2) if otype == "CALL" else -norm.cdf(-d2))
+    return {
+        "delta": float(Delta),
+        "gamma": float(Gamma),
+        "theta": float(Theta),
+        "vega": float(Vega),
+        "rho": float(Rho),
+    }
 
 
 def european_mc_paths(S0, T, r, q, sigma, paths=10000, steps=252, otype="CALL"):
@@ -494,6 +548,301 @@ def run_option_job(job_id: str, product: str, algo: str, params: dict):
 
         # ... keep your existing non-chain branches (American/Asian/Barrier etc.) ...
         raise ValueError("Unsupported combination or missing parameters.")
+
+    except Exception as e:
+        set_job_status(job_id, "Failed", error=str(e))
+
+
+# --- QAE wrapper ---
+from quantum.qae_pricer import qae_price, Market as QMarket
+
+
+@shared_task(bind=True, name="option_pricing.run_option_job")
+def run_option_job(self, job_id: str, params: dict):
+    set_job_status(job_id, "Running")
+    try:
+        product = params.get("product") or "European"
+        algo = params.get("algo") or "BlackScholes"
+
+        # --- European historical (single) or chain (multi) ---
+        if product == "European":
+            use_chain = str(params.get("use_chain", "true")).lower() not in (
+                "0",
+                "false",
+                "no",
+                "off",
+            )
+
+            # Common rates
+            r = float(params.get("r", 0.01))
+            q = float(params.get("q", 0.0))
+
+            if use_chain and "legs" in params:
+                # Multi-leg from option chain — for each leg we compute S0, IV or hist sigma fallback, T and price
+                out_legs = []
+                notionals = []
+                prices = []
+                for idx, leg in enumerate(params["legs"]):
+                    tkr = normalize_ticker(leg.get("ticker", ""))
+                    expiry = leg.get("expiry", "")
+                    K = float(leg.get("strike", 0))
+                    qty = float(leg.get("qty", 1))
+                    otype = (
+                        "CALL"
+                        if str(leg.get("option_type", "CALL")).upper().startswith("C")
+                        else "PUT"
+                    )
+                    # spot
+                    tk = yf.Ticker(tkr)
+                    fi = tk.fast_info or {}
+                    S0 = fi.get("last_price") or fi.get("regularMarketPrice")
+                    if not S0:
+                        hist = tk.history(period="5d")["Close"].dropna()
+                        if hist.empty:
+                            raise ValueError(f"{tkr}: no recent price")
+                        S0 = float(hist.iloc[-1])
+                    # T
+                    from datetime import datetime, timezone
+
+                    T = max(
+                        1e-6,
+                        (
+                            datetime.fromisoformat(expiry).replace(tzinfo=timezone.utc)
+                            - datetime.now(timezone.utc)
+                        ).days
+                        / 365.0,
+                    )
+                    # sigma (try chain mid IV; fallback hist)
+                    sigma = None
+                    try:
+                        ch = tk.option_chain(expiry)
+                        tbl = ch.calls if otype == "CALL" else ch.puts
+                        row = (
+                            tbl.loc[(tbl["strike"] - K).abs().idxmin()]
+                            if not tbl.empty
+                            else None
+                        )
+                        if row is not None and "impliedVolatility" in row:
+                            iv = float(row["impliedVolatility"])
+                            sigma = max(1e-6, iv)
+                    except Exception:
+                        pass
+                    if sigma is None:
+                        ret = tk.history(period="1y")["Close"].pct_change().dropna()
+                        if ret.empty:
+                            raise ValueError(f"{tkr}: cannot infer sigma")
+                        sigma = float(ret.std() * np.sqrt(252))
+
+                    if algo == "BlackScholes":
+                        price = black_scholes_price(S0, K, T, r, sigma, otype, q)
+                        greeks = black_scholes_greeks(S0, K, T, r, sigma, otype, q)
+                        leg_res = {
+                            "leg": idx + 1,
+                            "ticker": tkr,
+                            "expiry": expiry,
+                            "otype": otype,
+                            "strike": K,
+                            "qty": qty,
+                            "S0": S0,
+                            "sigma": sigma,
+                            "T": T,
+                            "price": price,
+                            "stderr": 0.0,
+                            "greeks": greeks,
+                        }
+                    elif algo == "MonteCarlo":
+                        steps = int(params.get("num_steps", 252))
+                        paths = int(params.get("num_paths", 100000))
+                        save_paths = str(params.get("save_paths", "false")).lower() in (
+                            "1",
+                            "true",
+                            "yes",
+                            "on",
+                        )
+                        price, stderr, paths_meta = european_mc_price(
+                            S0,
+                            K,
+                            T,
+                            r,
+                            sigma,
+                            otype,
+                            q,
+                            paths,
+                            steps,
+                            save_paths,
+                            (job_id if idx == 0 else None),
+                        )
+                        leg_res = {
+                            "leg": idx + 1,
+                            "ticker": tkr,
+                            "expiry": expiry,
+                            "otype": otype,
+                            "strike": K,
+                            "qty": qty,
+                            "S0": S0,
+                            "sigma": sigma,
+                            "T": T,
+                            "price": price,
+                            "stderr": stderr,
+                        }
+                        if paths_meta and idx == 0:
+                            leg_res["paths"] = paths_meta
+                    else:  # QAE
+                        m = QMarket(
+                            S0=float(S0), r=r, sigma=float(sigma), T=float(T), q=q
+                        )
+                        prices = qae_price(
+                            m,
+                            [K],
+                            otype,
+                            num_qubits=int(params.get("qubits", 8)),
+                            sampler=str(params.get("sampler", "terra")),
+                        )
+                        price = float(prices[K])
+                        stderr = 0.0
+                        leg_res = {
+                            "leg": idx + 1,
+                            "ticker": tkr,
+                            "expiry": expiry,
+                            "otype": otype,
+                            "strike": K,
+                            "qty": qty,
+                            "S0": S0,
+                            "sigma": sigma,
+                            "T": T,
+                            "price": price,
+                            "stderr": stderr,
+                            "qae_meta": {
+                                "qubits": int(params.get("qubits", 8)),
+                                "sampler": str(params.get("sampler", "terra")),
+                            },
+                        }
+                    out_legs.append(leg_res)
+                    notionals.append(qty * price)
+                    prices.append(price)
+
+                totals = {
+                    "notional": float(sum(notionals)),
+                    "weightedAvg": float(
+                        np.average(prices, weights=[abs(l["qty"]) for l in out_legs])
+                    ),
+                }
+                res = {
+                    "algo": algo,
+                    "legs": out_legs,
+                    "totals": totals,
+                    "product": "European",
+                }
+                set_job_status(job_id, "Succeeded", result=res)
+                return
+
+            else:
+                # Historical single
+                tkr = normalize_ticker(params.get("ticker", ""))
+                K = float(params.get("strike"))
+                otype = (
+                    "CALL"
+                    if str(params.get("option_type", "CALL")).upper().startswith("C")
+                    else "PUT"
+                )
+                tk = yf.Ticker(tkr)
+                fi = tk.fast_info or {}
+                S0 = fi.get("last_price") or fi.get("regularMarketPrice")
+                if not S0:
+                    hist = tk.history(period="5d")["Close"].dropna()
+                    if hist.empty:
+                        raise ValueError(f"{tkr}: no recent price")
+                    S0 = float(hist.iloc[-1])
+                # T from expiry or T
+                if params.get("expiry"):
+                    from datetime import datetime, timezone
+
+                    T = max(
+                        1e-6,
+                        (
+                            datetime.fromisoformat(params["expiry"]).replace(
+                                tzinfo=timezone.utc
+                            )
+                            - datetime.now(timezone.utc)
+                        ).days
+                        / 365.0,
+                    )
+                else:
+                    T = float(params.get("T", 0.5))
+                if params.get("sigma") not in (None, ""):
+                    sigma = float(params["sigma"])
+                else:
+                    ret = tk.history(period="1y")["Close"].pct_change().dropna()
+                    if ret.empty:
+                        raise ValueError(f"{tkr}: cannot infer sigma")
+                    sigma = float(ret.std() * np.sqrt(252))
+
+                if algo == "BlackScholes":
+                    price = black_scholes_price(S0, K, T, r, sigma, otype, q)
+                    greeks = black_scholes_greeks(S0, K, T, r, sigma, otype, q)
+                    res = {
+                        "algo": "BlackScholes",
+                        "product": "European",
+                        "source": "historical",
+                        "ticker": tkr,
+                        "inferred": {"S0": S0, "T": T, "sigma": sigma, "r": r, "q": q},
+                        "price": price,
+                        "stderr": 0.0,
+                        "greeks": greeks,
+                    }
+                elif algo == "MonteCarlo":
+                    steps = int(params.get("num_steps", 252))
+                    paths = int(params.get("num_paths", 100000))
+                    save_paths = str(params.get("save_paths", "false")).lower() in (
+                        "1",
+                        "true",
+                        "yes",
+                        "on",
+                    )
+                    price, stderr, paths_meta = european_mc_price(
+                        S0, K, T, r, sigma, otype, q, paths, steps, save_paths, job_id
+                    )
+                    # expected payoff (undiscounted) ~ price * exp(rT)
+                    expected_payoff = float(price * np.exp(r * T))
+                    res = {
+                        "algo": "MonteCarlo",
+                        "product": "European",
+                        "source": "historical",
+                        "ticker": tkr,
+                        "inferred": {"S0": S0, "T": T, "sigma": sigma, "r": r, "q": q},
+                        "price": price,
+                        "stderr": stderr,
+                        "expected_payoff": expected_payoff,
+                        "paths": paths_meta,
+                    }
+                else:  # QAE
+                    m = QMarket(S0=float(S0), r=r, sigma=float(sigma), T=float(T), q=q)
+                    prices = qae_price(
+                        m,
+                        [K],
+                        otype,
+                        num_qubits=int(params.get("qubits", 8)),
+                        sampler=str(params.get("sampler", "terra")),
+                    )
+                    price = float(prices[K])
+                    res = {
+                        "algo": "QAE",
+                        "product": "European",
+                        "source": "historical",
+                        "ticker": tkr,
+                        "inferred": {"S0": S0, "T": T, "sigma": sigma, "r": r, "q": q},
+                        "price": price,
+                        "stderr": 0.0,
+                        "qae_meta": {
+                            "qubits": int(params.get("qubits", 8)),
+                            "sampler": str(params.get("sampler", "terra")),
+                        },
+                    }
+
+                set_job_status(job_id, "Succeeded", result=res)
+                return
+
+        raise ValueError("Unsupported product or parameters")
 
     except Exception as e:
         set_job_status(job_id, "Failed", error=str(e))
